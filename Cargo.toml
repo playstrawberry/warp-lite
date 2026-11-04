@@ -2,7 +2,7 @@
 name = "warp-lite"
 version = "0.1.0"
 edition = "2024"
-license = "LicenseRef-All-Rights-Reserved"
+license = "LicenseRef-Strawberry-Source-Available-1.0"
 publish = false
 authors = ["Strawberry Interactive LLC"]
 description = "Standalone, permission-checked server warps."
