@@ -3,7 +3,6 @@
 
 mod lang;
 mod model;
-mod safety;
 mod store;
 
 #[cfg(target_arch = "wasm32")]

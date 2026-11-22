@@ -1,13 +1,13 @@
 use crate::{
     lang,
-    model::{self, Config, Id, Location, MAX_PENDING, Pending, Queue, Warps},
-    safety, store,
+    model::{self, Config, Id, Location, MAX_PENDING, Pending, Warps},
+    store,
 };
+use sp_travel::runtime::{Rules, Settings, Travels, find, here, id};
 use std::{
     collections::BTreeMap,
     path::PathBuf,
     sync::{Arc, Mutex, MutexGuard, Weak},
-    time::Instant,
 };
 use strawberry_plugin_api::{
     Context, EventHandler, Player, Plugin, PluginMetadata, Result, Screen, Server,
@@ -18,13 +18,12 @@ use strawberry_plugin_api::{
     commands::CommandHandler,
     common::NamedColor,
     events::{
-        EntityDamageEvent, FailureVerdict, HandlerOptions, HandlerPriority, InventoryClickEvent,
-        InventoryCloseEvent, PlayerDeathEvent, PlayerLeaveEvent, PlayerMoveEvent,
-        PlayerTeleportEvent,
+        FailureVerdict, HandlerOptions, HandlerPriority, InventoryClickEvent, InventoryCloseEvent,
+        PlayerDeathEvent, PlayerLeaveEvent,
     },
     events_wit::{
-        EntityDamageEventData, InventoryClickEventData, InventoryCloseEventData,
-        PlayerDeathEventData, PlayerLeaveEventData, PlayerMoveEventData, PlayerTeleportEventData,
+        InventoryClickEventData, InventoryCloseEventData, PlayerDeathEventData,
+        PlayerLeaveEventData,
     },
     gui::Gui,
     item_stack::ItemStack,
@@ -32,7 +31,6 @@ use strawberry_plugin_api::{
     permissions, register_plugin,
     scheduler::{self, SchedulerExt},
     text::TextComponent,
-    uuid::Uuid,
 };
 
 const USE: &str = "warp-lite:use";
@@ -49,10 +47,9 @@ struct State {
     dir: PathBuf,
     config: Config,
     warps: Warps,
-    queue: Queue,
+    /// The waits, cooldowns and teleports (`sp-travel`); `None` before load and after unload.
+    travels: Option<Travels<WarpRules>>,
     menus: BTreeMap<Id, Menu>,
-    clock: Instant,
-    timer: Option<u32>,
     writer: Option<u32>,
     running: bool,
 }
@@ -63,10 +60,8 @@ impl Default for State {
             dir: PathBuf::new(),
             config: Config::default(),
             warps: Warps::new(),
-            queue: Queue::default(),
+            travels: None,
             menus: BTreeMap::new(),
-            clock: Instant::now(),
-            timer: None,
             writer: None,
             running: false,
         }
@@ -77,32 +72,6 @@ fn lock(state: &Shared) -> MutexGuard<'_, State> {
     state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn now(state: &State) -> u64 {
-    state.clock.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
-}
-
-fn id(player: &Player) -> Id {
-    let uuid = player.get_id();
-    (uuid.high, uuid.low)
-}
-
-fn find(server: &Server, key: Id) -> Option<Player> {
-    server.get_player_by_uuid(Uuid {
-        high: key.0,
-        low: key.1,
-    })
-}
-
-// Location encoding and poison-tolerant locking.
-fn here(player: &Player) -> Location {
-    Location {
-        world: player.get_world().get_name(),
-        pos: player.get_position(),
-        yaw: player.get_yaw(),
-        pitch: player.get_pitch(),
-    }
 }
 
 fn permitted(player: &Player, name: &str) -> bool {
@@ -117,71 +86,31 @@ fn say(player: &Player, key: &str, args: &[&str]) {
     player.send_system_message(component(&player.get_locale(), key, args), false);
 }
 
-fn stop_empty_timer(shared: &Shared) {
-    let task = {
-        let mut state = lock(shared);
-        if state.queue.pending.is_empty() {
-            state.timer.take()
-        } else {
-            None
-        }
-    };
-    if let Some(task) = task {
-        scheduler::cancel_task(task);
-    }
-}
+/// warp-lite's part of a travel: when the wait ends the player must still hold the warp's permission and the warp
+/// must still be the one he asked for.
+struct WarpRules(Weak<Mutex<State>>);
 
-// Only one one-shot deadline task, and at most BATCH completions in one callback.
-fn arm(shared: &Shared, server: &Server) {
-    let delay = {
-        let state = lock(shared);
-        if state.timer.is_some() || !state.running {
-            return;
-        }
-        let Some(due) = state.queue.pending.values().map(|p| p.due).min() else {
-            return;
+impl Rules for WarpRules {
+    fn recheck(&self, player: &Player, pending: &Pending) -> std::result::Result<(), &'static str> {
+        let Some(shared) = self.0.upgrade() else {
+            return Err("cancelled");
         };
-        due.saturating_sub(now(&state)).div_ceil(50).max(1)
-    };
-    let weak = Arc::downgrade(shared);
-    let task = server.schedule_delayed_task(delay, move |server| {
-        let Some(shared) = weak.upgrade() else {
-            return;
-        };
-        let due = {
-            let mut state = lock(&shared);
-            state.timer = None;
-            let time = now(&state);
-            state.queue.due(time)
-        };
-        for (key, pending) in due {
-            let Some(player) = find(&server, key) else {
-                continue;
-            };
-            let current = here(&player);
-            let allowed = permitted(&player, &pending.warp);
-            let alive = player.get_health() > 0.0;
-            let check = {
-                let state = lock(&shared);
-                pending.revalidate(&current, state.warps.get(&pending.warp), allowed, alive)
-            };
-            let result = check.and_then(|()| safety::teleport(&server, &player, &pending.target));
-            match result {
-                Ok(()) => {
-                    {
-                        let mut state = lock(&shared);
-                        let time = now(&state);
-                        let seconds = state.config.cooldown_seconds;
-                        state.queue.succeeded(key, time, seconds);
-                    }
-                    say(&player, "teleported", &[&pending.warp]);
-                }
-                Err(key) => say(&player, key, &[]),
-            }
-        }
-        arm(&shared, &server);
-    });
-    lock(shared).timer = Some(task);
+        let allowed = permitted(player, &pending.label);
+        let alive = player.get_health() > 0.0;
+        let current = here(player);
+        let state = lock(&shared);
+        model::revalidate(
+            pending,
+            &current,
+            state.warps.get(&pending.label),
+            allowed,
+            alive,
+        )
+    }
+
+    fn say(&self, player: &Player, key: &str, args: &[&str]) {
+        say(player, key, args);
+    }
 }
 
 fn begin(
@@ -193,33 +122,14 @@ fn begin(
     if !permitted(player, name) {
         return Err("no_permission");
     }
-    let key = id(player);
-    let start = here(player);
-    if !start.valid() || player.get_health() <= 0.0 {
-        return Err("cancelled");
-    }
-    let entity = player.as_entity().get_id() as i32;
-    let delay = {
-        let mut state = lock(shared);
-        let target = state.warps.get(name).cloned().ok_or("not_found")?;
-        let time = now(&state);
-        let delay = state.config.delay_seconds;
-        state.queue.begin(
-            key,
-            Pending {
-                warp: name.into(),
-                target,
-                start,
-                entity,
-                due: time.saturating_add(delay * 1000),
-            },
-            time,
-        )?;
-        delay
+    let (target, travels) = {
+        let state = lock(shared);
+        (
+            state.warps.get(name).cloned().ok_or("not_found")?,
+            state.travels.clone().ok_or("cancelled")?,
+        )
     };
-    say(player, "waiting", &[name, &delay.to_string()]);
-    arm(shared, server);
-    Ok(())
+    travels.begin(server, player, name, target)
 }
 
 #[derive(Clone)]
@@ -426,67 +336,14 @@ impl CommandHandler for Run {
 
 struct Events(Shared);
 
-impl EventHandler<PlayerMoveEvent> for Events {
-    fn handle(&self, _server: Server, event: PlayerMoveEventData) -> PlayerMoveEventData {
-        if lock(&self.0).queue.pending.is_empty() || event.cancelled {
-            return event;
-        }
-        let key = id(&event.player);
-        if !lock(&self.0).queue.pending.contains_key(&key) {
-            return event;
-        }
-        let world = event.player.get_world().get_name();
-        let cancelled = {
-            let mut state = lock(&self.0);
-            if state
-                .queue
-                .pending
-                .get(&key)
-                .is_some_and(|p| model::moved(&p.start, &world, event.to_position))
-            {
-                state.queue.pending.remove(&key);
-                true
-            } else {
-                false
-            }
-        };
-        if cancelled {
-            stop_empty_timer(&self.0);
-            say(&event.player, "moved", &[]);
-        }
-        event
-    }
-}
-
-impl EventHandler<EntityDamageEvent> for Events {
-    fn handle(&self, server: Server, event: EntityDamageEventData) -> EntityDamageEventData {
-        if event.cancelled || !event.damage.is_finite() || event.damage <= 0.0 {
-            return event;
-        }
-        let key = { lock(&self.0).queue.cancel_entity(event.entity_id) };
-        if let Some(key) = key {
-            stop_empty_timer(&self.0);
-            if let Some(player) = find(&server, key) {
-                say(&player, "damaged", &[]);
-            }
-        }
-        event
-    }
-}
-
+// A waiting travel of a player who leaves or dies is dropped by `sp-travel`; the menu session is ours.
 fn forget(shared: &Shared, player: &Player) {
     let key = id(player);
-    {
-        let mut state = lock(shared);
-        state.queue.pending.remove(&key);
-        state.menus.remove(&key);
-    }
-    stop_empty_timer(shared);
+    lock(shared).menus.remove(&key);
 }
 
 fn has_transient(shared: &Shared) -> bool {
-    let state = lock(shared);
-    !state.queue.pending.is_empty() || !state.menus.is_empty()
+    !lock(shared).menus.is_empty()
 }
 
 impl EventHandler<PlayerLeaveEvent> for Events {
@@ -501,15 +358,6 @@ impl EventHandler<PlayerLeaveEvent> for Events {
 impl EventHandler<PlayerDeathEvent> for Events {
     fn handle(&self, _server: Server, event: PlayerDeathEventData) -> PlayerDeathEventData {
         if has_transient(&self.0) {
-            forget(&self.0, &event.player);
-        }
-        event
-    }
-}
-
-impl EventHandler<PlayerTeleportEvent> for Events {
-    fn handle(&self, _server: Server, event: PlayerTeleportEventData) -> PlayerTeleportEventData {
-        if !lock(&self.0).queue.pending.is_empty() {
             forget(&self.0, &event.player);
         }
         event
@@ -605,10 +453,22 @@ impl Plugin for WarpLite {
         let config = Config::parse(text.as_deref().unwrap_or(DEFAULT_CONFIG))
             .map_err(|key| lang::text("en", key, &[]))?;
         let warps = store::load(&dir).map_err(|key| lang::text("en", key, &[]))?;
+        // Moves and hits reach the script only when a travel waits (`Travels::register`): a server without a
+        // delay has nothing to cancel, and the checks at the moment of the travel still refuse a player who moved.
+        let travels = Travels::new(
+            WarpRules(Arc::downgrade(&self.state)),
+            Settings {
+                delay_seconds: config.delay_seconds,
+                cooldown_seconds: config.cooldown_seconds,
+                look: true,
+            },
+        );
+        travels.register(&context)?;
         *lock(&self.state) = State {
             dir,
             config,
             warps,
+            travels: Some(travels),
             running: true,
             ..State::default()
         };
@@ -665,11 +525,8 @@ impl Plugin for WarpLite {
                 )?;
             };
         }
-        observer!(PlayerMoveEvent);
-        observer!(EntityDamageEvent);
         observer!(PlayerLeaveEvent);
         observer!(PlayerDeathEvent);
-        observer!(PlayerTeleportEvent);
         observer!(InventoryCloseEvent);
         context.register_event_handler_with_options::<InventoryClickEvent, _>(
             Events(Arc::clone(&self.state)),
@@ -684,15 +541,16 @@ impl Plugin for WarpLite {
     }
 
     fn on_unload(&self, _context: Context) -> Result<()> {
-        let (timer, writer) = {
+        let (travels, writer) = {
             let mut state = lock(&self.state);
             state.running = false;
-            state.queue.pending.clear();
-            state.queue.cooldowns.clear();
             state.menus.clear();
-            (state.timer.take(), state.writer.take())
+            (state.travels.take(), state.writer.take())
         };
-        for task in [timer, writer].into_iter().flatten() {
+        if let Some(travels) = travels {
+            travels.stop();
+        }
+        if let Some(task) = writer {
             scheduler::cancel_task(task);
         }
         Ok(())

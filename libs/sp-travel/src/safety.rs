@@ -1,5 +1,10 @@
-//! One teleport boundary: inspect loaded destinations, then use the current teleport call.
-use crate::model::Location;
+//! One teleport boundary: look at a loaded destination, then make the one teleport call and check the arrival.
+//!
+//! The look reads the feet block, the head block and the floor of the destination column, only when its chunk is
+//! loaded: feet and head free of collision, liquid and hazard, the floor a full solid block. It never loads a chunk.
+//! A script whose destinations are a player's own (a home on a slab, the place he died) turns the look off; the
+//! arrival is checked either way.
+use crate::Location;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Block {
@@ -14,6 +19,7 @@ pub trait Destination {
     fn current(&mut self) -> Location;
 }
 
+#[cfg(any(test, target_arch = "wasm32"))]
 fn hazardous(name: &str) -> bool {
     matches!(
         name.strip_prefix("minecraft:").unwrap_or(name),
@@ -34,7 +40,12 @@ fn hazardous(name: &str) -> bool {
     )
 }
 
-pub fn travel(host: &mut impl Destination, target: &Location) -> Result<(), &'static str> {
+/// Travels to `target`; with `look` a loaded destination is inspected first and refused when it is not safe.
+pub fn travel(
+    host: &mut impl Destination,
+    target: &Location,
+    look: bool,
+) -> Result<(), &'static str> {
     if !target.valid() {
         return Err("invalid_location");
     }
@@ -43,7 +54,7 @@ pub fn travel(host: &mut impl Destination, target: &Location) -> Result<(), &'st
         target.pos.1.floor() as i32,
         target.pos.2.floor() as i32,
     );
-    if host.loaded((x.div_euclid(16), z.div_euclid(16))) {
+    if look && host.loaded((x.div_euclid(16), z.div_euclid(16))) {
         // A full-block floor cannot support a saved position floating above its top.
         if target.pos.1 - target.pos.1.floor() > 0.001 {
             return Err("unsafe_target");
@@ -73,6 +84,7 @@ pub fn teleport(
     server: &strawberry_plugin_api::Server,
     player: &strawberry_plugin_api::Player,
     target: &Location,
+    look: bool,
 ) -> Result<(), &'static str> {
     use strawberry_plugin_api::{Player, common::BlockPos, world::World};
 
@@ -123,7 +135,7 @@ pub fn teleport(
         player,
         world,
     };
-    travel(&mut live, target)?;
+    travel(&mut live, target, look)?;
     player.set_velocity((0.0, 0.0, 0.0));
     player.as_entity().set_fall_distance(0.0);
     Ok(())
@@ -132,7 +144,7 @@ pub fn teleport(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::tests::loc;
+    use crate::location::tests::loc;
 
     const AIR: Block = Block {
         passable: true,
@@ -199,7 +211,7 @@ mod tests {
     #[test]
     fn loaded_safe_column_reads_feet_head_floor_and_teleports_once() {
         let mut host = Fake::new(true);
-        assert_eq!(travel(&mut host, &loc()), Ok(()));
+        assert_eq!(travel(&mut host, &loc(), true), Ok(()));
         assert_eq!(host.reads, [(1, 64, -3), (1, 65, -3), (1, 63, -3)]);
         assert_eq!(host.chunks, [(0, -1)]);
         assert_eq!(host.calls, 1);
@@ -211,7 +223,7 @@ mod tests {
         for index in 0..3 {
             let mut host = Fake::new(true);
             host.blocks[index] = if index == 2 { AIR } else { STONE };
-            assert_eq!(travel(&mut host, &loc()), Err("unsafe_target"));
+            assert_eq!(travel(&mut host, &loc(), true), Err("unsafe_target"));
             assert_eq!(host.calls, 0);
         }
     }
@@ -220,16 +232,28 @@ mod tests {
     fn unloaded_destination_skips_all_block_reads_and_still_teleports() {
         let mut host = Fake::new(false);
         host.blocks = [STONE, STONE, AIR];
-        assert_eq!(travel(&mut host, &loc()), Ok(()));
+        assert_eq!(travel(&mut host, &loc(), true), Ok(()));
         assert!(host.reads.is_empty());
         assert_eq!(host.calls, 1);
+    }
+
+    #[test]
+    fn without_the_look_a_loaded_destination_is_not_read_and_the_arrival_is_still_checked() {
+        let mut host = Fake::new(true);
+        host.blocks = [STONE, STONE, AIR];
+        assert_eq!(travel(&mut host, &loc(), false), Ok(()));
+        assert!(host.reads.is_empty() && host.chunks.is_empty());
+        assert_eq!(host.calls, 1);
+        let mut host = Fake::new(true);
+        host.cancelled = true;
+        assert_eq!(travel(&mut host, &loc(), false), Err("teleport_failed"));
     }
 
     #[test]
     fn rejected_or_redirected_teleport_is_not_reported_as_arrival() {
         let mut host = Fake::new(true);
         host.cancelled = true;
-        assert_eq!(travel(&mut host, &loc()), Err("teleport_failed"));
+        assert_eq!(travel(&mut host, &loc(), true), Err("teleport_failed"));
         assert_eq!(host.calls, 1);
     }
 
@@ -239,7 +263,7 @@ mod tests {
         host.cancelled = true;
         host.current = loc();
         host.current.world = "other".into();
-        assert_eq!(travel(&mut host, &loc()), Err("teleport_failed"));
+        assert_eq!(travel(&mut host, &loc(), true), Err("teleport_failed"));
     }
 
     #[test]
@@ -247,10 +271,10 @@ mod tests {
         let mut target = loc();
         target.pos.1 += 0.5;
         let mut host = Fake::new(true);
-        assert_eq!(travel(&mut host, &target), Err("unsafe_target"));
+        assert_eq!(travel(&mut host, &target, true), Err("unsafe_target"));
         assert_eq!(host.calls, 0);
         let mut host = Fake::new(false);
-        assert_eq!(travel(&mut host, &target), Ok(()));
+        assert_eq!(travel(&mut host, &target, true), Ok(()));
     }
 
     #[test]
@@ -258,7 +282,7 @@ mod tests {
         let mut host = Fake::new(false);
         let mut target = loc();
         target.pos.0 = f64::NAN;
-        assert_eq!(travel(&mut host, &target), Err("invalid_location"));
+        assert_eq!(travel(&mut host, &target, true), Err("invalid_location"));
         assert!(host.chunks.is_empty());
         assert_eq!(host.calls, 0);
     }

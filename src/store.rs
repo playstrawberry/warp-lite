@@ -1,74 +1,22 @@
-use crate::model::{Location, MAX_WARPS, Warps, name};
-use std::{fs, io::Read, path::Path};
+//! The warp list's file: `warps.tsv`, in `sp-travel`'s list form.
+use crate::model::{MAX_WARPS, Warps};
+pub use sp_travel::files::read_optional;
+use sp_travel::files::{self, Shape};
+use std::path::Path;
 
 pub const MAX_FILE: u64 = 128 * 1024;
+const SHAPE: Shape = Shape {
+    header: "warp-lite\t1",
+    max_entries: MAX_WARPS,
+    max_bytes: MAX_FILE,
+};
 
 pub fn decode(text: &str) -> Result<Warps, &'static str> {
-    if text.len() as u64 > MAX_FILE {
-        return Err("data_error");
-    }
-    let mut lines = text.lines();
-    if lines.next() != Some("warp-lite\t1") {
-        return Err("data_error");
-    }
-    let mut warps = Warps::new();
-    for line in lines {
-        let f: Vec<&str> = line.split('\t').collect();
-        if f.len() != 7 || warps.len() >= MAX_WARPS {
-            return Err("data_error");
-        }
-        let key = name(f[0]).filter(|n| n == f[0]).ok_or("data_error")?;
-        let loc = Location {
-            world: f[1].into(),
-            pos: (
-                f[2].parse().map_err(|_| "data_error")?,
-                f[3].parse().map_err(|_| "data_error")?,
-                f[4].parse().map_err(|_| "data_error")?,
-            ),
-            yaw: f[5].parse().map_err(|_| "data_error")?,
-            pitch: f[6].parse().map_err(|_| "data_error")?,
-        };
-        if !loc.valid() || warps.insert(key, loc).is_some() {
-            return Err("data_error");
-        }
-    }
-    Ok(warps)
+    files::decode(SHAPE, text)
 }
 
 pub fn encode(warps: &Warps) -> Result<String, &'static str> {
-    if warps.len() > MAX_WARPS {
-        return Err("data_error");
-    }
-    let mut out = String::from("warp-lite\t1\n");
-    for (key, loc) in warps {
-        if name(key).as_ref() != Some(key) || !loc.valid() {
-            return Err("data_error");
-        }
-        out.push_str(&format!(
-            "{key}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            loc.world, loc.pos.0, loc.pos.1, loc.pos.2, loc.yaw, loc.pitch
-        ));
-    }
-    if out.len() as u64 > MAX_FILE {
-        return Err("data_error");
-    }
-    Ok(out)
-}
-
-pub fn read_optional(path: &Path, limit: u64) -> Result<Option<String>, &'static str> {
-    let file = match fs::File::open(path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err("data_error"),
-    };
-    let mut bytes = Vec::new();
-    file.take(limit + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| "data_error")?;
-    if bytes.len() as u64 > limit {
-        return Err("data_error");
-    }
-    String::from_utf8(bytes).map(Some).map_err(|_| "data_error")
+    files::encode(SHAPE, warps)
 }
 
 pub fn load(dir: &Path) -> Result<Warps, &'static str> {
@@ -77,12 +25,11 @@ pub fn load(dir: &Path) -> Result<Warps, &'static str> {
 }
 
 pub fn save(dir: &Path, warps: &Warps) -> Result<(), &'static str> {
-    let text = encode(warps)?;
-    let tmp = dir.join("warps.tmp");
-    let path = dir.join("warps.tsv");
-    fs::write(&tmp, text)
-        .and_then(|()| fs::rename(tmp, path))
-        .map_err(|_| "save_error")
+    files::replace(
+        &dir.join("warps.tmp"),
+        &dir.join("warps.tsv"),
+        &encode(warps)?,
+    )
 }
 
 #[cfg(test)]

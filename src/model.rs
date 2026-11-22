@@ -1,56 +1,34 @@
-use std::collections::BTreeMap;
+//! What is warp-lite's own: the warp list's bounds, its settings and its menu pages. The location, the wait and
+//! the cooldown are `sp-travel`'s, shared with the other teleport scripts.
+pub use sp_travel::{Location, files::Locations as Warps, queue::Pending, settings::Field};
+// Only the wasm-only runtime reads these; a host build (the unit tests) would flag them unused.
+#[cfg(target_arch = "wasm32")]
+pub use sp_travel::{Id, name, queue::MAX_PENDING};
 
 pub const MAX_WARPS: usize = 256;
-pub const MAX_PENDING: usize = 128;
-pub const MAX_COOLDOWNS: usize = 2048;
 pub const PAGE_SIZE: usize = 45;
-pub const BATCH: usize = 8;
-pub type Id = (u64, u64);
-pub type Warps = BTreeMap<String, Location>;
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct Location {
-    pub world: String,
-    pub pos: (f64, f64, f64),
-    pub yaw: f32,
-    pub pitch: f32,
-}
-
-impl Location {
-    pub fn valid(&self) -> bool {
-        !self.world.is_empty()
-            && self.world.len() <= 128
-            && !self.world.chars().any(char::is_control)
-            && self.pos.0.is_finite()
-            && self.pos.0.abs() < 30_000_000.0
-            && self.pos.2.is_finite()
-            && self.pos.2.abs() < 30_000_000.0
-            && self.pos.1.is_finite()
-            && (-2048.0..=2048.0).contains(&self.pos.1)
-            && self.yaw.is_finite()
-            && self.pitch.is_finite()
-            && (-90.0..=90.0).contains(&self.pitch)
-    }
-}
-
-pub fn name(input: &str) -> Option<String> {
-    (!input.is_empty()
-        && input.len() <= 32
-        && input
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-'))
-    .then(|| input.to_ascii_lowercase())
-}
-
-pub fn moved(start: &Location, world: &str, pos: (f64, f64, f64)) -> bool {
-    start.world != world
-        || !pos.0.is_finite()
-        || !pos.1.is_finite()
-        || !pos.2.is_finite()
-        || (start.pos.0 - pos.0).abs() > 0.01
-        || (start.pos.1 - pos.1).abs() > 0.01
-        || (start.pos.2 - pos.2).abs() > 0.01
-}
+/// The settings file's keys, bounds and defaults, in the order of [`Config`]'s fields.
+pub const FIELDS: [Field; 3] = [
+    Field {
+        key: "delay_seconds",
+        min: 0,
+        max: 60,
+        default: 3,
+    },
+    Field {
+        key: "cooldown_seconds",
+        min: 0,
+        max: 3600,
+        default: 10,
+    },
+    Field {
+        key: "max_warps",
+        min: 1,
+        max: MAX_WARPS as u64,
+        default: 128,
+    },
+];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
@@ -71,123 +49,37 @@ impl Default for Config {
 
 impl Config {
     pub fn parse(text: &str) -> Result<Self, &'static str> {
-        if text.len() > 4096 {
+        let values = sp_travel::settings::parse(text, &FIELDS)?;
+        let [delay_seconds, cooldown_seconds, max_warps] = values.as_slice() else {
             return Err("config_error");
-        }
-        let mut config = Self::default();
-        let mut seen = std::collections::BTreeSet::new();
-        for line in text
-            .lines()
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && !s.starts_with('#'))
-        {
-            let (key, value) = line.split_once('=').ok_or("config_error")?;
-            let key = key.trim();
-            if !seen.insert(key) {
-                return Err("config_error");
-            }
-            let value: u64 = value.trim().parse().map_err(|_| "config_error")?;
-            match key {
-                "delay_seconds" if value <= 60 => config.delay_seconds = value,
-                "cooldown_seconds" if value <= 3600 => config.cooldown_seconds = value,
-                "max_warps" if (1..=MAX_WARPS as u64).contains(&value) => {
-                    config.max_warps = value as usize
-                }
-                _ => return Err("config_error"),
-            }
-        }
-        Ok(config)
+        };
+        Ok(Self {
+            delay_seconds: *delay_seconds,
+            cooldown_seconds: *cooldown_seconds,
+            max_warps: usize::try_from(*max_warps).map_err(|_| "config_error")?,
+        })
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct Pending {
-    pub warp: String,
-    pub target: Location,
-    pub start: Location,
-    pub entity: i32,
-    pub due: u64,
-}
-
-impl Pending {
-    pub fn revalidate(
-        &self,
-        current: &Location,
-        saved: Option<&Location>,
-        permitted: bool,
-        alive: bool,
-    ) -> Result<(), &'static str> {
-        if !permitted {
-            return Err("no_permission");
-        }
-        if !alive {
-            return Err("cancelled");
-        }
-        if saved != Some(&self.target) {
-            return Err("warp_changed");
-        }
-        if moved(&self.start, &current.world, current.pos) {
-            return Err("moved");
-        }
-        Ok(())
+/// The recheck when a wait ends, in this order: the permission, the player's life, the warp as it is saved now,
+/// the place he asked from.
+pub fn revalidate(
+    pending: &Pending,
+    current: &Location,
+    saved: Option<&Location>,
+    permitted: bool,
+    alive: bool,
+) -> Result<(), &'static str> {
+    if !permitted {
+        return Err("no_permission");
     }
-}
-
-#[derive(Default)]
-pub struct Queue {
-    pub pending: BTreeMap<Id, Pending>,
-    pub cooldowns: BTreeMap<Id, u64>,
-}
-
-impl Queue {
-    pub fn begin(&mut self, id: Id, pending: Pending, now: u64) -> Result<(), &'static str> {
-        self.cooldowns.retain(|_, until| *until > now);
-        if self.pending.contains_key(&id) {
-            return Err("already_waiting");
-        }
-        if self.cooldowns.contains_key(&id) {
-            return Err("cooldown");
-        }
-        if self.pending.len() >= MAX_PENDING
-            || self.cooldowns.len() + self.pending.len() >= MAX_COOLDOWNS
-        {
-            return Err("busy");
-        }
-        self.pending.insert(id, pending);
-        Ok(())
+    if !alive {
+        return Err("cancelled");
     }
-
-    pub fn due(&mut self, now: u64) -> Vec<(Id, Pending)> {
-        let ids: Vec<Id> = self
-            .pending
-            .iter()
-            .filter(|(_, p)| p.due <= now)
-            .take(BATCH)
-            .map(|(id, _)| *id)
-            .collect();
-        ids.into_iter()
-            .filter_map(|id| self.pending.remove(&id).map(|p| (id, p)))
-            .collect()
+    if saved != Some(&pending.target) {
+        return Err("warp_changed");
     }
-
-    pub fn succeeded(&mut self, id: Id, now: u64, seconds: u64) {
-        if seconds != 0
-            && (self.cooldowns.contains_key(&id) || self.cooldowns.len() < MAX_COOLDOWNS)
-        {
-            self.cooldowns
-                .insert(id, now.saturating_add(seconds.saturating_mul(1000)));
-        }
-    }
-
-    pub fn cancel_entity(&mut self, entity: i32) -> Option<Id> {
-        let id = self
-            .pending
-            .iter()
-            .find(|(_, p)| p.entity == entity)
-            .map(|(id, _)| *id)?;
-        self.pending.remove(&id);
-        Some(id)
-    }
+    pending.still(current, alive)
 }
 
 pub fn page(names: &[String], requested: usize) -> (usize, &[String]) {
@@ -212,49 +104,12 @@ pub(crate) mod tests {
 
     fn pending(due: u64) -> Pending {
         Pending {
-            warp: "spawn".into(),
+            label: "spawn".into(),
             target: loc(),
             start: loc(),
             entity: 42,
             due,
         }
-    }
-
-    #[test]
-    fn names_are_canonical_bounded_and_cannot_inject_permissions() {
-        assert_eq!(name("Spawn_1"), Some("spawn_1".into()));
-        for bad in ["", "a.b", "*", "../x", "a b", "a\tb", "é", &"a".repeat(33)] {
-            assert_eq!(name(bad), None, "{bad}");
-        }
-    }
-
-    #[test]
-    fn persisted_locations_reject_nonfinite_invalid_or_injectable_data() {
-        assert!(loc().valid());
-        let mut value = loc();
-        for invalid in [f64::NAN, f64::INFINITY, 30_000_000.0, -30_000_000.0] {
-            value.pos.0 = invalid;
-            assert!(!value.valid());
-        }
-        value = loc();
-        value.pitch = 91.0;
-        assert!(!value.valid());
-        value = loc();
-        value.world = "world\tother".into();
-        assert!(!value.valid());
-        value = loc();
-        value.world = "a".repeat(129);
-        assert!(!value.valid());
-    }
-
-    #[test]
-    fn movement_in_any_axis_or_world_cancels_but_rotation_does_not() {
-        assert!(!moved(&loc(), "world", loc().pos));
-        assert!(moved(&loc(), "world", (1.52, 64.0, -2.5)));
-        assert!(moved(&loc(), "world", (1.5, 64.02, -2.5)));
-        assert!(moved(&loc(), "world", (1.5, 64.0, -2.52)));
-        assert!(moved(&loc(), "other", loc().pos));
-        assert!(moved(&loc(), "world", (f64::NAN, 64.0, -2.5)));
     }
 
     #[test]
@@ -281,85 +136,41 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn duplicate_requests_cannot_replace_the_origin_or_deadline() {
-        let mut q = Queue::default();
-        q.begin((1, 1), pending(3000), 0).unwrap();
-        assert_eq!(q.begin((1, 1), pending(0), 1), Err("already_waiting"));
-        assert!(q.due(2999).is_empty());
-        assert_eq!(q.due(3000).len(), 1);
-        assert!(q.due(3000).is_empty());
-    }
-
-    #[test]
-    fn cancelling_drops_the_request_without_starting_a_cooldown() {
-        let mut q = Queue::default();
-        q.begin((1, 1), pending(0), 0).unwrap();
-        q.pending.remove(&(1, 1));
-        assert!(q.due(0).is_empty());
-        assert!(q.cooldowns.is_empty());
-    }
-
-    #[test]
-    fn damage_only_cancels_the_matching_player_once() {
-        let mut q = Queue::default();
-        q.begin((1, 1), pending(1000), 0).unwrap();
-        assert_eq!(q.cancel_entity(99), None);
-        assert_eq!(q.cancel_entity(42), Some((1, 1)));
-        assert_eq!(q.cancel_entity(42), None);
-        assert!(q.cooldowns.is_empty());
-    }
-
-    #[test]
     fn execution_rechecks_permission_deletion_changes_death_and_movement() {
         let wait = pending(1000);
-        assert_eq!(wait.revalidate(&loc(), Some(&loc()), true, true), Ok(()));
+        assert_eq!(revalidate(&wait, &loc(), Some(&loc()), true, true), Ok(()));
         assert_eq!(
-            wait.revalidate(&loc(), Some(&loc()), false, true),
+            revalidate(&wait, &loc(), Some(&loc()), false, true),
             Err("no_permission")
         );
         assert_eq!(
-            wait.revalidate(&loc(), None, true, true),
+            revalidate(&wait, &loc(), None, true, true),
             Err("warp_changed")
         );
         assert_eq!(
-            wait.revalidate(&loc(), Some(&loc()), true, false),
+            revalidate(&wait, &loc(), Some(&loc()), true, false),
             Err("cancelled")
         );
         let mut other = loc();
         other.pos.1 += 1.0;
         assert_eq!(
-            wait.revalidate(&other, Some(&loc()), true, true),
+            revalidate(&wait, &other, Some(&loc()), true, true),
             Err("moved")
         );
         assert_eq!(
-            wait.revalidate(&loc(), Some(&other), true, true),
+            revalidate(&wait, &loc(), Some(&other), true, true),
             Err("warp_changed")
         );
     }
 
     #[test]
-    fn cooldown_is_success_only_and_not_removed_on_disconnect() {
-        let mut q = Queue::default();
-        q.succeeded((1, 1), 1000, 10);
-        assert_eq!(q.begin((1, 1), pending(0), 10999), Err("cooldown"));
-        q.begin((1, 1), pending(0), 11000).unwrap();
-    }
-
-    #[test]
-    fn work_and_retained_state_have_hard_caps() {
-        let mut q = Queue::default();
-        for n in 0..MAX_PENDING {
-            q.begin((0, n as u64), pending(0), 0).unwrap();
-        }
-        assert_eq!(q.begin((0, MAX_PENDING as u64), pending(0), 0), Err("busy"));
-        assert_eq!(q.due(0).len(), BATCH);
-        q.pending.clear();
-        for n in 0..MAX_COOLDOWNS {
-            q.succeeded((0, n as u64), 0, 10);
-        }
-        assert_eq!(q.begin((1, 0), pending(0), 1), Err("busy"));
-        q.begin((1, 0), pending(0), 10_000).unwrap();
-        assert!(q.cooldowns.is_empty());
+    fn the_default_settings_file_reads_back_as_the_defaults() {
+        let text = sp_travel::settings::default_text(&FIELDS);
+        assert_eq!(
+            text,
+            "delay_seconds=3\ncooldown_seconds=10\nmax_warps=128\n"
+        );
+        assert_eq!(Config::parse(&text).unwrap(), Config::default());
     }
 
     #[test]

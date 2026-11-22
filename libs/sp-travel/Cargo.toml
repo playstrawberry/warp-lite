@@ -1,0 +1,14 @@
+[package]
+name = "sp-travel"
+version = "0.1.0"
+edition = "2024"
+description = "Strawberry library: one way to travel for the small teleport scripts (warps, homes, spawn, back): the saved location, the wait and the cooldown, the destination check and the one teleport call."
+authors = ["Strawberry Interactive LLC"]
+license = "LicenseRef-Strawberry-Source-Available-1.0"
+publish = false
+
+[dependencies]
+strawberry-plugin-api = { version = "=0.2.2", registry = "strawberry" }
+
+[lints]
+workspace = true

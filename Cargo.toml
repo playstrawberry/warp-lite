@@ -8,10 +8,19 @@ authors = ["Strawberry Interactive LLC"]
 description = "Standalone, permission-checked server warps."
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-strawberry-plugin-api = { version = "=0.2.1", registry = "strawberry" }
+sp-travel = { path = "libs/sp-travel" }
+strawberry-plugin-api = { version = "=0.2.2", registry = "strawberry" }
 
 # A repository of its own, not a member of a larger workspace.
 [workspace]
+members = ["libs/sp-travel"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
