@@ -8,7 +8,7 @@ license = "LicenseRef-Strawberry-Source-Available-1.0"
 publish = false
 
 [dependencies]
-strawberry-plugin-api = { version = "=0.2.2", registry = "strawberry" }
+strawberry-plugin-api = { version = "=0.2.3", registry = "strawberry" }
 
 [lints]
 workspace = true
